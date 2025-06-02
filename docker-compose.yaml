@@ -1,0 +1,202 @@
+networks:
+  tu_local:
+    driver: bridge
+  vpn_net:
+    driver: bridge  
+
+volumes:
+  open-webui: {}
+  n8n_data: {}
+  ollama_data: {}
+
+services:
+  vpn:
+    image: dperson/openvpn-client:latest
+    container_name: vpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    volumes:
+      - ./vpn/con:/vpn               # Your folder with multiple .ovpn files and possibly auth.txt
+      - ./vpn/start-vpn.sh:/start-vpn.sh # Your random picker script
+      - ./vpn/update-resolv-conf:/etc/openvpn/update-resolv-conf:ro
+    command: /start-vpn.sh
+    restart: unless-stopped
+    networks:
+      - vpn_net
+      
+  nginx:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    volumes:
+      - ./nginx/data:/data
+      - ./nginx/letsencrypt:/etc/letsencrypt
+    ports:
+      - "443:443"  # HTTPS port
+      - "80:80"  # HTTP port
+      - "81:81"
+      # Add any other Stream port you want to expose
+      # - '21:21' # FTP
+    depends_on:
+      - open-webui
+      - n8n
+      - ollama
+      - mcp-server
+      - postgres
+    networks:
+      - tu_local
+
+  postgres:
+    image: postgres-pgvector:16
+    container_name: postgres
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mcpuser
+      POSTGRES_PASSWORD: mcppass
+      POSTGRES_DB: mcpdb
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h postgres -U mcpuser -d mcpdb']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      # 1. init scripts (runs once on first init)
+      - ./postgres/initdb:/docker-entrypoint-initdb.d
+      # 2. persistent data (survives restarts)
+      - ./postgres/data:/var/lib/postgresql/data
+    networks:
+      - tu_local
+    
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: yourLogin@techuties.com
+      PGADMIN_DEFAULT_PASSWORD: adminpass
+      # OPTIONAL: Disable mandatory email confirmation
+      PGADMIN_DISABLE_POSTFIX: "true"
+      PGADMIN_HOST: pgadmin
+      PGADMIN_LISTEN_PORT: 5051
+    ports:
+      - "5050:5051"     # browse http://localhost:5050
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: 
+      - tu_local
+
+  n8n:
+    image: n8nio/n8n
+    restart: unless-stopped
+    container_name: n8n
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=admin
+      - N8N_HOST=n8n
+      - N8N_PORT=5678
+      - N8N_LOG_LEVEL=debug
+      - N8N_LOG_FILE_LOCATION=/home/n8n/logs/n8n.log
+      - N8N_LOG_FILE_MAXSIZE=50    # max 50MB
+      - N8N_LOG_FILE_MAXCOUNT=60   # Max Log files count
+      - N8N_RUNNERS_ENABLED=true
+      - GENERIC_TIMEZONE="Europe/Berlin"
+      - TZ="Europe/Berlin"
+    volumes:
+      - ./n8n:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - vpn_net     # all egress goes via vpn-gateway
+      - tu_local    # ingress from NPM
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    restart: unless-stopped
+    container_name: open-webui
+    ports:
+      - 3000:8080
+    environment:
+      - OWUI_LOG_LEVEL=debug
+      - OWUI_HOST=open-webui
+      - DATA_DIR=/app/backend/data 
+      - WEBUI_NAME=TechUties AI
+      - OWUI_PORT=8080
+      - OPENAI_API_KEY=yourOpenAIKey
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - ENABLE_STT=true
+      - ENABLE_TTS=true
+    depends_on:
+      - vpn
+      - ollama
+      - n8n
+    volumes:
+      - ./open-webui:/app/backend/data
+    networks:
+      - vpn_net     # all egress goes via vpn-gateway
+      - tu_local    # ingress from NPM
+
+  ollama:
+    image: ollama/ollama
+    restart: unless-stopped
+    container_name: ollama
+    pull_policy: always
+    tty: true
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=ollama
+      - OLLAMA_PORT=11434
+    volumes:
+      - ./ollama:/root/.ollama
+    networks:
+      - vpn_net     # all egress goes via vpn-gateway
+      - tu_local    # ingress from NPM
+
+  mcp-server:
+    image: python:3.11-slim
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    working_dir: /app
+    volumes:
+      - ./mcp-server:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - MCP_HTTP_HOST=mcp-server
+      - MCP_HTTP_PORT=8000
+      - DB_HOST=postgres
+      - DB_USER=mcpuser
+      - DB_PASSWORD=mcppass
+      - DB_NAME=mcpdb
+    depends_on:
+      - vpn
+      - ollama
+    command: >
+      sh -c "
+        python -m venv /app/venv && \
+        . /app/venv/bin/activate && \
+        pip install --upgrade pip && \
+        pip install --no-cache-dir -r requirements.txt && \
+        pip install playwright && \
+        playwright install && \
+        python server.py
+       "
+    networks:
+      - vpn_net     # all egress goes via vpn-gateway
+      - tu_local    # ingress from NPM
